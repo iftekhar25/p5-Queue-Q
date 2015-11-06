@@ -69,7 +69,7 @@ sub new {
     for my $required_param (qw/server port queue_name/) {
         $params->{$required_param}
             or die sprintf(
-                q{%s->new(): Missing mandatory parameter "%s".},
+                q{%s->new(): Missing mandatory parameter "%s"},
                 __PACKAGE__, $required_param
             );
     }
@@ -77,7 +77,7 @@ sub new {
     for my $provided_param (keys %$params) {
         unless ($VALID_PARAMS{$provided_param}) {
             warn sprintf(
-                q{%s->new() encountered an unknown parameter "%s".},
+                q{%s->new() encountered an unknown parameter "%s"},
                 __PACKAGE__, $provided_param
             );
             delete $params->{$provided_param};
@@ -286,13 +286,13 @@ sub _claim_items_internal {
 
             keys %metadata
                 or warn sprintf(
-                    '%s->_claim_items_internal() fetched empty metadata for item_key=%s!',
+                    '%s->_claim_items_internal() fetched empty metadata for item_key=%s',
                     __PACKAGE__, $item_key
                 );
 
             defined $payload
                 or warn sprintf(
-                    '%s->_claim_items_internal() fetched undefined payload for item_key=%s!',
+                    '%s->_claim_items_internal() fetched undefined payload for item_key=%s',
                     __PACKAGE__, $item_key
                 );
 
@@ -432,14 +432,14 @@ sub mark_items_as_processed {
         $rh->wait_all_responses();
         $deleted == @chunk
             or warn sprintf(
-                '%s->mark_items_as_processed() could not remove some item/meta keys!',
+                '%s->mark_items_as_processed() could not remove some item/meta keys',
                 __PACKAGE__
             );
     }
 
     @$failed
         and warn sprintf(
-            '%s->mark_items_as_processed(): %d/%d items were not removed from the working queue (%s)!',
+            '%s->mark_items_as_processed(): %d/%d items were not removed from the working queue (%s)',
             __PACKAGE__, int(@$failed), int(@$flushed + @$failed), $self->_working_queue
         );
 
@@ -834,7 +834,7 @@ sub remove_failed_items {
 
     $error_count
         and warn sprintf(
-            '%s->remove_failed_items() encountered %d errors while removing %d failed items!',
+            '%s->remove_failed_items() encountered %d errors while removing %d failed items',
             __PACKAGE__, $error_count, $item_count
         );
 
@@ -874,20 +874,20 @@ sub queue_length {
     $params //= {};
     ref $params eq 'HASH'
         or die sprintf(
-            q{%s->%s() accepts a single parameter (a hash reference) with all named parameters.},
+            q{%s->%s() accepts a single parameter (a hash reference) with all named parameters},
             __PACKAGE__, 'queue_length'
         );
 
     my $subqueue_name = $params->{subqueue_name} // 'unprocessed';
     my $subqueue_accessor_name = $VALID_SUBQUEUES{$subqueue_name}
         or die sprintf(
-            q{%s->queue_length() couldn't find subqueue_accessor for subqueue_name=%s.},
+            q{%s->queue_length() couldn't find subqueue_accessor for subqueue_name=%s},
             __PACKAGE__, $subqueue_name
         );
 
     my $subqueue_redis_key = $self->$subqueue_accessor_name
         or die sprintf(
-            q{%s->queue_length() couldn't map subqueue_name=%s to a Redis key.},
+            q{%s->queue_length() couldn't map subqueue_name=%s to a Redis key},
             __PACKAGE__, $subqueue_name
         );
 
@@ -904,14 +904,14 @@ sub peek_item {
     $params //= {};
     ref $params eq 'HASH'
         or die sprintf(
-            q{%s->%s() accepts a single parameter (a hash reference) with all named parameters.},
+            q{%s->%s() accepts a single parameter (a hash reference) with all named parameters},
             __PACKAGE__, 'peek_item'
         );
 
     my $direction = $params->{direction} // 'f';
     $direction eq 'b' || $direction eq 'f'
         or die sprintf(
-            q{%s->%s(): "direction" is either 'b' (back) or 'f' (front).},
+            q{%s->%s(): "direction" is either 'b' (back) or 'f' (front)},
             __PACKAGE__, 'peek_item'
         );
     $direction = $direction eq 'f' ? -1 : 0;
@@ -919,12 +919,12 @@ sub peek_item {
     my $subqueue_name = $params->{subqueue_name} // 'unprocessed';
     my $subqueue_accessor_name = $VALID_SUBQUEUES{$subqueue_name}
         or die sprintf(
-            q{%s->%s() couldn't find subqueue_accessor for subqueue_name=%s.},
+            q{%s->%s() couldn't find subqueue_accessor for subqueue_name=%s},
             __PACKAGE__, 'peek_item', $subqueue_name
         );
     my $subqueue_redis_key = $self->$subqueue_accessor_name
         or die sprintf(
-            q{%s->%s() couldn't map subqueue_name=%s to a Redis key.},
+            q{%s->%s() couldn't map subqueue_name=%s to a Redis key},
             __PACKAGE__, 'peek_item', $subqueue_name
         );
 
@@ -966,34 +966,34 @@ sub get_items_age {
     $params //= {};
     ref $params eq 'HASH'
         or die sprintf(
-            q{%s->%s() accepts a single parameter (a hash reference) with all named parameters.},
+            q{%s->%s() accepts a single parameter (a hash reference) with all named parameters},
             __PACKAGE__, 'get_item_age'
         );
 
     my $subqueue_name = $params->{subqueue_name} // 'unprocessed';
     my $subqueue_accessor_name = $VALID_SUBQUEUES{$subqueue_name}
         or die sprintf(
-            q{%s->get_item_age() couldn't find subqueue_accessor for subqueue_name=%s.},
+            q{%s->get_item_age() couldn't find subqueue_accessor for subqueue_name=%s},
             __PACKAGE__, $subqueue_name
         );
 
     my $subqueue_redis_key = $self->$subqueue_accessor_name
         or die sprintf(
-            q{%s->get_item_age() couldn't map subqueue_name=%s to a Redis key.},
+            q{%s->get_item_age() couldn't map subqueue_name=%s to a Redis key},
             __PACKAGE__, $subqueue_name
         );
 
     my $items = $params->{items} // [];
     ref $items eq 'ARRAY'
         or die sprintf(
-            q{%s->get_items_age()'s "items" parameter has to be an array!},
+            q{%s->get_items_age()'s "items" parameter has to be an array},
             __PACKAGE__
         );
 
     if (@$items) {
         grep { not $_->isa('Queue::Q::ReliableFIFO::ItemNG2000TopFun') } @$items
             and die sprintf(
-                '%s->get_items_age() only accepts objects of type %s or one of its subclasses.',
+                '%s->get_items_age() only accepts objects of type %s or one of its subclasses',
                 __PACKAGE__, 'Queue::Q::ReliableFIFO::ItemNG2000TopFun'
             );
 
@@ -1004,7 +1004,7 @@ sub get_items_age {
         for my $item (@$items) {
             $time_created = $item->time_created
                 or die sprintf(
-                    '%s->get_items_age() found an item without a "time_created" stamp!',
+                    '%s->get_items_age() found an item without a "time_created" stamp',
                     __PACKAGE__
                 );
             push @ages, ($time_created ? $now - $time_created : 0);
@@ -1016,7 +1016,7 @@ sub get_items_age {
         my $direction = $params->{direction} // 'f';
         $direction eq 'b' || $direction eq 'f'
             or die sprintf(
-                q{%s->get_items_age(): "direction" is either 'b' (back) or 'f' (front).},
+                q{%s->get_items_age(): "direction" is either 'b' (back) or 'f' (front)},
                 __PACKAGE__
             );
         $direction = $direction eq 'f' ? -1 : 0;
@@ -1051,7 +1051,7 @@ sub percent_memory_used {
     my (undef, $mem_avail) = $rh->config_get('maxmemory');
     if ($mem_avail == 0) {
         warn sprintf(
-            q{%s->percent_memory_used(): "maxmemory" is set to 0, can't derive a percentage.},
+            q{%s->percent_memory_used(): "maxmemory" is set to 0, can't derive a percentage},
             __PACKAGE__
         );
         return undef;
@@ -1069,7 +1069,7 @@ sub _raw_items {
     my $n = $params->{number_of_items} || 0;
     $n =~ m/^\d+$/
         or die sprintf(
-            q{%s->%s(): "%s" must be a positive integer, or zero to signify all items.},
+            q{%s->%s(): "%s" must be a positive integer, or zero to signify all items},
             __PACKAGE__, $internal->{caller}, 'number_of_items'
         );
 
@@ -1167,21 +1167,21 @@ sub handle_expired_items {
     $params //= {};
     ref $params eq 'HASH'
         or die sprintf(
-            q{%s->%s() accepts a single parameter (a hash reference) with all named parameters.},
+            q{%s->%s() accepts a single parameter (a hash reference) with all named parameters},
             __PACKAGE__, 'handle_expired_items'
         );
 
     my $timeout = $params->{timeout} // $self->busy_expiry_time;
     $timeout =~ m/^\d+$/ && $timeout
         or die sprintf(
-            q{%s->handle_expired_items(): "$timeout" must be a positive integer!},
+            q{%s->handle_expired_items(): "$timeout" must be a positive integer},
             __PACKAGE__
         );
 
     my $action = $params->{action} // 'requeue';
     $action eq 'requeue' || $action eq 'drop'
         or die sprintf(
-            '%s->handle_expired_items(): Unknown action (%s)!',
+            '%s->handle_expired_items(): Unknown action (%s)',
             __PACKAGE__, $action
         );
 

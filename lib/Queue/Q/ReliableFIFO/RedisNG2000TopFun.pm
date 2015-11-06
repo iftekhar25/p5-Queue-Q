@@ -233,6 +233,7 @@ sub _claim_items_internal {
     my $rh                = $self->redis_handle;
     my $unprocessed_queue = $self->_unprocessed_queue;
     my $working_queue     = $self->_working_queue;
+    my $now               = Time::HiRes::time;
 
     if ( $n_items == 1 ) {
         if ( $mode == NON_BLOCKING ) {
@@ -242,6 +243,7 @@ sub _claim_items_internal {
             $rh->hincrby("meta-$item_key", process_count => 1, sub { });
 
             my %metadata = $rh->hgetall("meta-$item_key");
+            $metadata{time_dequeued} = $now;
             my $payload  = $rh->get("item-$item_key");
 
             return Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
@@ -257,6 +259,7 @@ sub _claim_items_internal {
 
             $rh->hincrby("meta-$item_key", process_count => 1, sub { });
             my %metadata = $rh->hgetall("meta-$item_key");
+            $metadata{time_dequeued} = $now;
             my $payload  = $rh->get("item-$item_key");
 
             return Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({

@@ -1,17 +1,15 @@
-package Queue::Q::ReliableFIFO::RedisNG2000TopFun;
+package Queue::Q::ReliableFIFO::Redis2;
 
 use strict;
 use warnings;
-
-use parent 'Queue::Q::ReliableFIFO';
 
 use Carp qw/croak cluck/;
 use Data::UUID::MT;
 use Redis qw//;
 use Time::HiRes qw//;
 
-use Queue::Q::ReliableFIFO::Lua;
-use Queue::Q::ReliableFIFO::ItemNG2000TopFun;
+use Redis::ScriptCache;
+use Queue::Q::ReliableFIFO::Item2;
 
 our ( %VALID_SUBQUEUES, %VALID_PARAMS );
 
@@ -21,7 +19,7 @@ BEGIN {
         unprocessed
         working
         processed
-        failed
+        unsuccessful
     /;
 
     # valid constructor params
@@ -46,6 +44,7 @@ use Class::XSAccessor {
         '_lua'
     ],
     setters => {
+        set_queue_name         => 'queue_name',
         set_requeue_limit      => 'requeue_limit',
         set_busy_expiry_time   => 'busy_expiry_time',
         set_claim_wait_timeout => 'claim_wait_timeout'
@@ -87,7 +86,7 @@ sub new {
     my $self = bless({
         requeue_limit      => 5,
         busy_expiry_time   => 30,
-        claim_wait_timeout => 1,
+        claim_wait_timeout => 30,
         db_id              => 0,
         warn_on_requeue    => 0,
         %$params
@@ -113,14 +112,41 @@ sub new {
         %default_redis_options, %redis_options
     );
 
-    $self->{_lua} = Queue::Q::ReliableFIFO::Lua->new(
-        redis_conn => $self->redis_handle
+    $self->{_lua} = Redis::ScriptCache->new(
+        redis_conn => $self->redis_handle,
+        script_dir => '/usr/local/git_tree/main/lib/Bookings/Redis/Lua'
     );
+
+    $self->{_lua}->register_all_scripts();
 
     $params->{db_id}
         and $self->redis_handle->select($params->{db_id});
 
     return $self;
+}
+
+####################################################################################################
+####################################################################################################
+
+sub override_queue_name {
+    my ( $self, $name ) = @_;
+
+    die sprintf(
+            q{%s->name_override() expects a < name > parameter},
+            __PACKAGE__
+        ) unless $name;
+
+    # 1. override the name of the queue
+    $self->set_queue_name( $name );
+
+    # 2. override subqueue attributes with name of queue
+    for my $subqueue_name ( keys %VALID_SUBQUEUES ) {
+        my $accessor_name = $VALID_SUBQUEUES{$subqueue_name};
+        my $redis_list_name = sprintf('%s_%s', $name, $subqueue_name);
+        $self->{$accessor_name} = $redis_list_name;
+    }
+
+    return;
 }
 
 ####################################################################################################
@@ -162,13 +188,20 @@ sub enqueue_items {
         my $item_id  = $UUID->create_hex();
         my $item_key = sprintf('%s-%s', $self->queue_name, $item_id);
 
-        # Create the payload item.
-        $rh->setnx("item-$item_key" => $input_item)
-            or die sprintf(
-                '%s->enqueue_items() failed to setnx() data for item_key=%s. This means the key ' .
-                'already existed, which is highly improbable.',
-                __PACKAGE__, $item_key
-            );
+        eval{
+            # Create the payload item.
+            $rh->setnx("item-$item_key" => $input_item)
+                or die sprintf(
+                    '%s->enqueue_items() failed to setnx() data for item_key=%s. This means the key ' .
+                    'already existed, which is highly improbable.',
+                    __PACKAGE__, $item_key
+                );
+             1;
+        } or do{
+            my $err_msg = $@ || 'zombie error';
+            my @ret = ({err_msg => $err_msg , fail => '1'});
+            return \@ret;
+        };
 
         my $now = Time::HiRes::time;
 
@@ -179,24 +212,29 @@ sub enqueue_items {
             time_enqueued => $now
         );
 
-        # Create metadata. This call will just die if not successful (in the rare event of having
-        #   a key with the same name in Redis that doesn't have a hash stored. If it does have one
-        #   that indeed has a hash stored (highly unlikely), we are really unfortunate (that is a
-        #   silent failure).
-        $rh->hmset("meta-$item_key" => %metadata);
-
         # Enqueue the actual item.
-        $rh->lpush($self->_unprocessed_queue, $item_key)
-            or die sprintf(
-                '%s->enqueue_items() failed to lpush() item_key=%s onto the unprocessed queue (%s).',
-                __PACKAGE__, $item_key, $self->_unprocessed_queue
-            );
-
-        push @created, Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
-            item_key => $item_key,
-            payload  => $input_item,
-            metadata => \%metadata
-        });
+        eval{
+            # Create metadata. This call will just die if not successful (in the rare event of having
+            #   a key with the same name in Redis that doesn't have a hash stored. If it does have one
+            #   that indeed has a hash stored (highly unlikely), we are really unfortunate (that is a
+            #   silent failure).
+            $rh->hmset("meta-$item_key" => %metadata);
+            $rh->lpush($self->_unprocessed_queue, $item_key)
+                or die sprintf(
+                    '%s->enqueue_items() failed to lpush() item_key=%s onto the unprocessed queue (%s).',
+                    __PACKAGE__, $item_key, $self->_unprocessed_queue
+                );
+            push @created, Queue::Q::ReliableFIFO::Item2->new({
+                item_key => $item_key,
+                payload  => $input_item,
+                metadata => \%metadata
+            });
+            1;
+        } or do{
+            my $err_msg = $@ || 'zombie error';
+            my @ret = ({err_msg => $err_msg , fail => '1'});
+            return \@ret;
+        };
     }
 
     return \@created;
@@ -206,8 +244,8 @@ sub enqueue_items {
 ####################################################################################################
 
 use constant {
-    BLOCKING => 0,
-    NON_BLOCKING => 1
+    BLOCKING => 1,
+    NON_BLOCKING => 0,
 };
 
 sub _claim_items_internal {
@@ -221,7 +259,7 @@ sub _claim_items_internal {
         );
 
     my $n_items = $params->{number_of_items} // 1;
-    $n_items =~ m/^\d+$/ && $n_items
+    $n_items =~ m/^[0-9]+$/ && $n_items
         or die sprintf(
             q{%s->%s()'s "number_of_items" parameter has to be a positive integer!},
             __PACKAGE__, $internal->{caller}
@@ -236,38 +274,47 @@ sub _claim_items_internal {
     my $now               = Time::HiRes::time;
 
     if ( $n_items == 1 ) {
-        if ( $mode == NON_BLOCKING ) {
-            my $item_key = $rh->rpoplpush($self->_unprocessed_queue, $self->_working_queue)
-                or return;
+        my @items;
+        eval{
+            if ( $mode == NON_BLOCKING ) {
+                my $item_key = $rh->rpoplpush($self->_unprocessed_queue, $self->_working_queue)
+                    or return 1; # unprocessed_queue is empty, return success
 
-            $rh->hincrby("meta-$item_key", process_count => 1, sub { });
+                $rh->hincrby("meta-$item_key", process_count => 1, sub { });
 
-            my %metadata = $rh->hgetall("meta-$item_key");
-            $metadata{time_dequeued} = $now;
-            my $payload  = $rh->get("item-$item_key");
+                my %metadata = $rh->hgetall("meta-$item_key");
+                $metadata{time_dequeued} = $now;
+                my $payload  = $rh->get("item-$item_key");
 
-            return Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
-                item_key => $item_key,
-                payload  => $payload,
-                metadata => \%metadata
-            });
-        } else { # $mode == BLOCKING
-            my $w_queue = $self->_working_queue;
-            my $u_queue = $self->_unprocessed_queue;
-            my $item_key = $rh->rpoplpush($u_queue, $w_queue) || $rh->brpoplpush($u_queue, $w_queue, $self->claim_wait_timeout)
-                or return;
+                unshift @items, Queue::Q::ReliableFIFO::Item2->new({
+                    item_key => $item_key,
+                    payload  => $payload,
+                    metadata => \%metadata
+                });
+            } else { # $mode == BLOCKING
+                my $w_queue = $self->_working_queue;
+                my $u_queue = $self->_unprocessed_queue;
+                my $item_key = $rh->rpoplpush($u_queue, $w_queue) || $rh->brpoplpush($u_queue, $w_queue, $self->claim_wait_timeout)
+                    or return 1; # unprocessed_queue is empty, return success
 
-            $rh->hincrby("meta-$item_key", process_count => 1, sub { });
-            my %metadata = $rh->hgetall("meta-$item_key");
-            $metadata{time_dequeued} = $now;
-            my $payload  = $rh->get("item-$item_key");
+                $rh->hincrby("meta-$item_key", process_count => 1, sub { });
+                my %metadata = $rh->hgetall("meta-$item_key");
+                $metadata{time_dequeued} = $now;
+                my $payload  = $rh->get("item-$item_key");
 
-            return Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
-                item_key => $item_key,
-                payload  => $payload,
-                metadata => \%metadata
-            });
-        }
+                unshift @items, Queue::Q::ReliableFIFO::Item2->new({
+                    item_key => $item_key,
+                    payload  => $payload,
+                    metadata => \%metadata
+                });
+            }
+            1;
+        } or do{
+            my $err_msg = $@ || 'zombie error';
+            my @ret = ({err_msg => $err_msg , fail => '1'});
+            return @ret;
+        };
+        return @items;
     } else {
         # When fetching multiple items:
         # - Non-blocking mode: We try to fetch one item, and then give up.
@@ -275,46 +322,44 @@ sub _claim_items_internal {
         #                    we switch to rpoplpush for greater throughput.
 
         my @items;
-
-        my $handler = sub {
-            defined(my $item_key = $_[0])
-                or return;
-
-            $rh->hincrby("meta-$item_key", process_count => 1, sub { });
-            my %metadata = $rh->hgetall("meta-$item_key");
-            my $payload  = $rh->get("item-$item_key");
-
-            keys %metadata
-                or warn sprintf(
-                    '%s->_claim_items_internal() fetched empty metadata for item_key=%s',
-                    __PACKAGE__, $item_key
-                );
-
-            defined $payload
-                or warn sprintf(
-                    '%s->_claim_items_internal() fetched undefined payload for item_key=%s',
-                    __PACKAGE__, $item_key
-                );
-
-            unshift @items, Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
-                item_key => $item_key,
-                payload  => $payload,
-                metadata => \%metadata
-            });
-        };
-
-        # Yes, there is a race, but it's an optimization only.
-        # This means that after we know how many items we have...
-        my $llen = $rh->llen($unprocessed_queue);
-        # ... we only take those. But the point is that, between these two comments (err, maybe
-        #   the code statements are more important) there might have been an enqueue_items(), so
-        #   that we are actually grabbing less than what the user asked for. But we are OK with
-        #   that, since the new items are too fresh anyway (they might even be too hot for that
-        #   user's tongue).
-        $n_items > $llen
-            and $n_items = $llen;
-
         eval {
+            my $handler = sub {
+                defined(my $item_key = $_[0])
+                   or return 1; # success, because unprocessed queue is empty
+
+                $rh->hincrby("meta-$item_key", process_count => 1, sub { });
+                my %metadata = $rh->hgetall("meta-$item_key");
+                my $payload  = $rh->get("item-$item_key");
+
+                keys %metadata
+                    or warn sprintf(
+                        '%s->_claim_items_internal() fetched empty metadata for item_key=%s',
+                        __PACKAGE__, $item_key
+                    );
+
+                defined $payload
+                    or warn sprintf(
+                        '%s->_claim_items_internal() fetched undefined payload for item_key=%s',
+                        __PACKAGE__, $item_key
+                    );
+                unshift @items, Queue::Q::ReliableFIFO::Item2->new({
+                    item_key => $item_key,
+                    payload  => $payload,
+                    metadata => \%metadata
+                });
+            };
+
+            # Yes, there is a race, but it's an optimization only.
+            # This means that after we know how many items we have...
+            my $llen = $rh->llen($unprocessed_queue);
+            # ... we only take those. But the point is that, between these two comments (err, maybe
+            #   the code statements are more important) there might have been an enqueue_items(), so
+            #   that we are actually grabbing less than what the user asked for. But we are OK with
+            #   that, since the new items are too fresh anyway (they might even be too hot for that
+            #   user's tongue).
+            $n_items > $llen
+                and $n_items = $llen;
+
             $rh->rpoplpush($unprocessed_queue, $working_queue, $handler)
                 for 1 .. $n_items;
             $rh->wait_all_responses;
@@ -337,13 +382,14 @@ sub _claim_items_internal {
                 '%s->_claim_items_internal() encountered an exception while claiming bulk items: %s',
                 __PACKAGE__, $eval_error
             );
+            my @ret = ({err_msg => $eval_error , fail => '1'});
+            return @ret;
         };
-
         return @items;
     }
 
     die sprintf(
-        '%s->_claim_items_internal(): Unreachable code. This should never happen.',
+        '%s->_claim_items_internal(): Unreachable code. This should never happen',
         __PACKAGE__
     );
 }
@@ -390,10 +436,10 @@ sub mark_items_as_processed {
             __PACKAGE__, 'mark_items_as_processed'
         );
 
-    grep { not $_->isa('Queue::Q::ReliableFIFO::ItemNG2000TopFun') } @$items
+    grep { $_ !~ m/\A\w+-0x[[:xdigit:]]+\z/ } @$items
         and die sprintf(
-            '%s->%s() only accepts objects of type %s or one of its subclasses.',
-            __PACKAGE__, 'mark_items_as_processed', 'Queue::Q::ReliableFIFO::ItemNG2000TopFun'
+            '%s->%s() only accepts UUIDs',
+            __PACKAGE__, 'mark_items_as_processed',
         );
 
     my $rh = $self->redis_handle;
@@ -405,8 +451,7 @@ sub mark_items_as_processed {
 
     # The callback receives the result of LREM() for removing the item from the working queue and
     #   populates %result. If LREM() succeeds, we need to clean up the payload and the metadata.
-    for my $item (@$items) {
-        my $item_key = $item->{item_key};
+    for my $item_key (@$items) {
         my $lrem_direction = 1; # Head-to-tail, though it should not make any difference... since
                                 #   the item is supposed to be unique anyway.
                                 # See http://redis.io/commands/lrem for details.
@@ -484,7 +529,7 @@ sub requeue_busy_error {
         $params,
         {
             caller                  => 'requeue_busy_error',
-            increment_process_count => 1,
+            increment_process_count => 0, # not necessary here, since it has been done at dequeue-time
             place                   => 0,
             source_queue            => $self->_working_queue
         }
@@ -500,7 +545,7 @@ sub requeue_failed_items {
             caller                  => 'requeue_failed_items',
             increment_process_count => 1,
             place                   => 1,
-            source_queue            => $self->_failed_queue
+            source_queue            => $self->_unsuccessful_queue
         }
     );
 }
@@ -531,10 +576,10 @@ sub __requeue  {
     my $source_queue = $internal->{source_queue}
         or die sprintf(q{%s->__requeue(): "source_queue" parameter is required.}, __PACKAGE__);
 
-    grep { not $_->isa('Queue::Q::ReliableFIFO::ItemNG2000TopFun') } @$items
+    grep { $_ !~ m/\A\w+-0x[[:xdigit:]]+\z/ } @$items
         and die sprintf(
-            '%s->%s() only accepts objects of type %s or one of its subclasses.',
-            __PACKAGE__, $internal->{caller}, 'Queue::Q::ReliableFIFO::ItemNG2000TopFun'
+            '%s->%s() only accepts UUIDs',
+            __PACKAGE__, $internal->{caller},
         );
 
     my $place                   = $internal->{place};
@@ -544,16 +589,20 @@ sub __requeue  {
     my $items_requeued = 0;
 
     eval {
-        for my $item (@$items) {
-            $items_requeued += $self->_lua->call(
-                requeue => 3,
-                # Requeue takes 3 keys: The source, ok-destination and fail-destination queues:
-                $source_queue, $self->_unprocessed_queue, $self->_failed_queue,
-                $item->{item_key},
-                $self->requeue_limit,
-                $place, # L or R end of distination queue
-                $error, # Error string if any
-                $increment_process_count
+        for my $item_key (@$items) {
+            $items_requeued += $self->_lua->run_script(
+                'requeue',
+                [
+                    3,                              # Requeue takes 3 keys: The source, ok-destination and fail-destination queues
+                    $source_queue,                  # KEYS[1]   source queue, from where the items needs to be moved
+                    $self->_unprocessed_queue,      # KEYS[2]   unprocessed queue
+                    $self->_unsuccessful_queue,     # KEYS[3]   unsuccessful queue
+                    $item_key,                      # ARGV[1]   Item UUID
+                    $self->requeue_limit,           # ARGV[2]   Number of reattempts before items gets marked failed
+                    $place,                         # ARGV[3]   L or R end of distination queue
+                    $error,                         # ARGV[4]   Error string if any
+                    $increment_process_count        # ARGV[5]   increment_process_count?
+                ],
             );
         }
         1;
@@ -590,7 +639,7 @@ sub handle_failed_items {
 
     my $rh = $self->redis_handle;
 
-    my @item_keys = $rh->lrange($self->_failed_queue, 0, -1);
+    my @item_keys = $rh->lrange($self->_unsuccessful_queue, 0, -1);
 
     my (%item_metadata, %item_payload, @failed_items);
     for my $item_key (@item_keys) {
@@ -618,7 +667,7 @@ sub handle_failed_items {
 
     # Queues (well, lists) in Redis are stored right-to-left.
     for my $item_key (reverse @item_keys) {
-        my $item = Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
+        my $item = Queue::Q::ReliableFIFO::Item2->new({
             item_key => $item_key,
             payload  => $item_payload{$item_key},
             metadata => $item_metadata{$item_key}
@@ -627,7 +676,7 @@ sub handle_failed_items {
         my $n = $action eq 'requeue' ?
                     $self->__requeue(
                         {
-                            items => [ $item ],
+                            items => [ $item_key ],
                             error => $item_metadata{$item_key}->{last_error}
                         },
                         {
@@ -636,11 +685,11 @@ sub handle_failed_items {
                             # This ensures we don't count another attempt:
                             increment_process_count => 0,
                             place                   => 0,
-                            source_queue            => $self->_failed_queue
+                            source_queue            => $self->_unsuccessful_queue
                         }
                     ) :
                 $action eq 'drop'                                  ?
-                    $rh->lrem($self->_failed_queue, -1, $item_key) :
+                    $rh->lrem($self->_unsuccessful_queue, -1, $item_key) :
                     undef;
 
         $n and push @failed_items, $item;
@@ -665,7 +714,7 @@ sub process_failed_items {
         );
 
     my $max_count = $params->{max_count} // 100;
-    $max_count =~ m/^\d+$/ && $max_count
+    $max_count =~ m/^[0-9]+$/ && $max_count
         or die sprintf(
             '%s->process_failed_items(): "max_count" parameter must be a positive integer!',
             __PACKAGE__
@@ -682,16 +731,16 @@ sub process_failed_items {
             __PACKAGE__
         );
 
-    my $temp_table = 'temp-' . $self->_failed_queue . $UUID->create_hex;
+    my $temp_table = 'temp-' . $self->_unsuccessful_queue . $UUID->create_hex;
     my $rh = $self->redis_handle;
 
-    my $failed_items = $self->queue_length({ subqueue_name => 'failed' });
-    
+    my $failed_items = $self->queue_length({ subqueue_name => 'unsuccessful' });
+
     my ($error_count, $i, $item_key, @done);
     my $item_count = ( $max_count && $max_count <= $failed_items ) ? $max_count : $failed_items;
-    
+
     MOVE_ITEMS_FROM_FAILED_QUEUE_TO_TEMP_TABLE : {
-        $rh->rpoplpush( $self->_failed_queue, $temp_table ) for ( 1 .. $item_count );
+        $rh->rpoplpush( $self->_unsuccessful_queue, $temp_table ) for ( 1 .. $item_count );
     }
 
     my $fail = sub {
@@ -710,7 +759,7 @@ sub process_failed_items {
                 q{%s->peek_item() found item_key=%s but not its payload! This should never happen!!},
                 __PACKAGE__, "item-$item_key"
             );
-        
+
         my @metadata = $rh->hgetall("meta-$item_key")
             or die sprintf(
                 q{%s->peek_item() found item_key=%s but not its metadata! This should never happen!!},
@@ -719,7 +768,7 @@ sub process_failed_items {
 
         my $response;
         eval {
-            $response = $callback->(Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
+            $response = $callback->(Queue::Q::ReliableFIFO::Item2->new({
                 item_key => $item_key,
                 payload  => $payload,
                 metadata => { @metadata }
@@ -744,7 +793,7 @@ sub process_failed_items {
     # the same as it was before processing.
     MOVE_BACK_ITEMS_FROM_TEMP_TABLE_TO_FAILED_QUEUE : {
         while ( my $item_key = $rh->lpop( $temp_table ) ) {
-            $rh->rpush( $self->_failed_queue, $item_key );
+            $rh->rpush( $self->_unsuccessful_queue, $item_key );
         }
     }
 
@@ -768,28 +817,28 @@ sub remove_failed_items {
         );
 
     my $min_age = delete($params->{min_age}) // 0;
-    $min_age =~ m/^\d+$/
+    $min_age =~ m/^[0-9]+$/
         or die sprintf(
             q{%s->%s(): "%s" must be a non-negative integer.},
             __PACKAGE__, 'remove_failed_items', 'min_age'
         );
 
     my $min_fc = delete($params->{min_fail_count}) // 0;
-    $min_fc =~ m/^\d+$/
+    $min_fc =~ m/^[0-9]+$/
         or die sprintf(
             q{%s->%s(): "%s" must be a non-negative integer.},
             __PACKAGE__, 'remove_failed_items', 'min_fail_count'
         );
 
     my $chunk = delete($params->{chunk}) // 100;
-    $chunk =~ m/^\d+$/ && $chunk
+    $chunk =~ m/^[0-9]+$/ && $chunk
         or die sprintf(
             q{%s->%s(): "%s" must be a positive integer.},
             __PACKAGE__, 'remove_failed_items', 'chunk'
         );
 
     my $log_limit = delete($params->{log_limit}) // 100;
-    $log_limit =~ m/^\d+$/ && $log_limit
+    $log_limit =~ m/^[0-9]+$/ && $log_limit
         or die sprintf(
             q{%s->%s(): "%s" must be a positive integer.},
             __PACKAGE__, 'remove_failed_items', 'log_limit'
@@ -804,7 +853,7 @@ sub remove_failed_items {
     my $min_tc = $now - $min_age;
 
     my $rh = $self->redis_handle;
-    my $failed_queue = $self->_failed_queue;
+    my $failed_queue = $self->_unsuccessful_queue;
 
     my @items_removed = ();
 
@@ -822,8 +871,7 @@ sub remove_failed_items {
                     and push @items_removed, $item;
                 # all good, should be marked deleted
                 return 1;
-            } 
-            
+            }
             # since the item was not supposed to be deleted,
             # the callback should send failure since we dont
             # want process failed items to delete the key
@@ -950,7 +998,7 @@ sub peek_item {
             __PACKAGE__, "item-$item_key"
         );
 
-    return Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
+    return Queue::Q::ReliableFIFO::Item2->new({
         item_key => $item_key,
         payload  => $payload,
         metadata => { @metadata }
@@ -991,10 +1039,10 @@ sub get_items_age {
         );
 
     if (@$items) {
-        grep { not $_->isa('Queue::Q::ReliableFIFO::ItemNG2000TopFun') } @$items
+        grep { not $_->isa('Queue::Q::ReliableFIFO::Item2') } @$items
             and die sprintf(
                 '%s->get_items_age() only accepts objects of type %s or one of its subclasses',
-                __PACKAGE__, 'Queue::Q::ReliableFIFO::ItemNG2000TopFun'
+                __PACKAGE__, 'Queue::Q::ReliableFIFO::Item2'
             );
 
         my (@ages, $time_created);
@@ -1067,7 +1115,7 @@ sub _raw_items {
     my ($self, $params, $internal) = @_;
 
     my $n = $params->{number_of_items} || 0;
-    $n =~ m/^\d+$/
+    $n =~ m/^[0-9]+$/
         or die sprintf(
             q{%s->%s(): "%s" must be a positive integer, or zero to signify all items},
             __PACKAGE__, $internal->{caller}, 'number_of_items'
@@ -1104,7 +1152,7 @@ sub _raw_items {
 
     my @items;
     for my $item_key (@item_keys) {
-        unshift @items, Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
+        unshift @items, Queue::Q::ReliableFIFO::Item2->new({
             item_key => $item_key,
             payload  => $items{$item_key}->{payload},
             metadata => $items{$item_key}->{metadata}
@@ -1125,7 +1173,7 @@ sub raw_items_working {
 
 sub raw_items_failed {
     my ($self, $params) = @_;
-    $self->_raw_items($params, { queue => 'failed', caller => 'raw_items_failed' });
+    $self->_raw_items($params, { queue => 'unsuccessful', caller => 'raw_items_failed' });
 }
 
 sub raw_items_temp {
@@ -1149,7 +1197,7 @@ sub raw_items_temp {
 
     my @items;
     for my $item_key (@item_keys) {
-        unshift @items, Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
+        unshift @items, Queue::Q::ReliableFIFO::Item2->new({
             item_key => $item_key,
             payload  => $items{$item_key}->{payload},
             metadata => $items{$item_key}->{metadata}
@@ -1172,7 +1220,7 @@ sub handle_expired_items {
         );
 
     my $timeout = $params->{timeout} // $self->busy_expiry_time;
-    $timeout =~ m/^\d+$/ && $timeout
+    $timeout =~ m/^[0-9]+$/ && $timeout
         or die sprintf(
             q{%s->handle_expired_items(): "$timeout" must be a positive integer},
             __PACKAGE__
@@ -1186,23 +1234,13 @@ sub handle_expired_items {
         );
 
     my $rh = $self->redis_handle;
-    my (%item_metadata, %item_payload);
 
     # Either we call Redis to know the length of the working queue, and then call
     #   $rh->lrange($self->_working_queue, -$working_queue_length, -1);
     # which costs us two RPCs, or just reverse what you get from a single RPC...
+    my %item_metadata;
     my @item_keys = $rh->lrange($self->_working_queue, 0, -1);
     for my $item_key (@item_keys) {
-        $rh->get("item-$item_key" => sub {
-            defined $_[0]
-                or die sprintf(
-                    q{%s->%s() found item_key=%s but not its payload! This should never happen!!},
-                    __PACKAGE__, 'handle_expired_items', "item-$item_key"
-                );
-
-            $item_payload{$item_key} = $_[0];
-        });
-
         $rh->hgetall("meta-$item_key" => sub {
             @_
                 or die sprintf(
@@ -1216,27 +1254,43 @@ sub handle_expired_items {
 
     $rh->wait_all_responses;
 
-    my $now = Time::HiRes::time;
-    my $window = $now - $timeout;
+    my $window = Time::HiRes::time - $timeout;
 
-    my @expired_items;
     my @candidates = grep {
         exists $item_metadata{$_} && $item_metadata{$_}->{time_enqueued} < $window
     } @item_keys;
 
+    my %item_payload;
+    for my $item_key (@candidates) {
+        $rh->get("item-$item_key" => sub {
+            defined $_[0]
+                or die sprintf(
+                    q{%s->%s() found item_key=%s but not its payload! This should never happen!!},
+                    __PACKAGE__, 'handle_expired_items', "item-$item_key"
+                );
+
+            $item_payload{$item_key} = $_[0];
+        });
+    }
+
+    $rh->wait_all_responses;
+
+    my @expired_items;
+
     # ... which is what I've chosen to do.
     for my $item_key (reverse @candidates) {
-        my $item = Queue::Q::ReliableFIFO::ItemNG2000TopFun->new({
+        next unless exists $item_payload{$item_key};
+        my $item = Queue::Q::ReliableFIFO::Item2->new({
             item_key => $item_key,
             payload  => $item_payload{$item_key},
             metadata => $item_metadata{$item_key}
         });
 
-        my $n = $action eq 'requeue'                            ?
-                    $self->requeue_busy({ items => [ $item ] }) :
-                $action eq 'drop'                                   ?
-                    $rh->lrem($self->_working_queue, -1, $item_key) :
-                    undef;
+        my $n = $action eq 'requeue'
+                    ? $self->requeue_busy({ items => [ $item_key ] })
+                    : $action eq 'drop'
+                        ? $rh->lrem($self->_working_queue, -1, $item_key)
+                        : undef;
 
         $n and push @expired_items, $item;
 
@@ -1245,6 +1299,8 @@ sub handle_expired_items {
             $rh->del("meta-$item_key");
         }
     }
+
+    $rh->wait_all_responses;
 
     return \@expired_items;
 }

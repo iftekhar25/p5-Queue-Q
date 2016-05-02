@@ -1,6 +1,5 @@
-package Queue::Q::ReliableFIFO::ItemNG2000TopFun;
+package Queue::Q::ReliableFIFO::Item2;
 
-use Data::Dumper;
 use strict;
 use warnings;
 
